@@ -1,8 +1,12 @@
-use std::{fs};
+mod sounds;
+
+use log::{LevelFilter, debug};
+use minifb::{Key, Scale, Window, WindowOptions};
+use rand::RngExt;
+use sounds::Audio;
+use std::fs;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use log::{debug, LevelFilter};
-use minifb::{Key, Window, WindowOptions};
 
 fn main() {
     simple_logger::SimpleLogger::new()
@@ -11,8 +15,8 @@ fn main() {
         .unwrap();
 
     debug!("Running CHIP-8 Emulator");
-    let mut cpu = CPU::new();
-    cpu.load_game("3-corax+.ch8");
+    let mut cpu = Emulator::new();
+    cpu.load_game("pong.ch8");
     cpu.run_loop();
 }
 
@@ -22,20 +26,66 @@ const INSTRUCTIONS_PER_SECOND: usize = 700; // tune per-ROM if needed
 const FRAMES_PER_SECOND: usize = 60;
 const TIMER_HZ: usize = 60;
 
-struct CPU {
+struct Emulator {
     registers: Registers,
     memory: Memory,
     stack: Stack,
-    display: Display
+    window: Window,
+    display: Display,
+    audio: Audio,
+
+    // Flag to mark if we're waiting for a key to be pressed.
+    // This will cause us to resume checking for that key instead
+    // of processing more instructions.
+    // The value is the register where we should put the value
+    // once we get the key press.
+    waiting_for_key: Option<u8>,
 }
 
-impl CPU {
+impl Emulator {
+    // Maps from the integer value to what the actual key looks like on a modern QWERTY keyboard.
+    // See this for reference: https://tobiasvl.github.io/blog/write-a-chip-8-emulator/#keypad
+    const KEY_MAPPING: [Key; 16] = [
+        Key::X,
+        Key::Key1,
+        Key::Key2,
+        Key::Key3,
+        Key::Q,
+        Key::W,
+        Key::E,
+        Key::A,
+        Key::S,
+        Key::D,
+        Key::Z,
+        Key::C,
+        Key::Key4,
+        Key::R,
+        Key::F,
+        Key::V,
+    ];
+
     fn new() -> Self {
-        Self{
+        let mut window = Window::new(
+            "CHIP-8 Emulator => ESC to exit",
+            WIDTH,
+            HEIGHT,
+            WindowOptions {
+                resize: true,
+                scale: Scale::X16,
+                ..WindowOptions::default()
+            },
+        )
+        .unwrap();
+        window.set_target_fps(FRAMES_PER_SECOND);
+
+        Self {
             registers: Registers::new(),
             memory: Memory::new(),
             stack: Stack::new(),
+            window,
             display: Display::new(),
+            audio: Audio::new(),
+            waiting_for_key: None,
         }
     }
 
@@ -49,18 +99,37 @@ impl CPU {
     }
 
     fn run_loop(&mut self) {
-        // Outer loop runs at 60hz, as defined by
-        while self.display.window.is_open() && !self.display.window.is_key_down(Key::Escape) {
+        // Outer loop runs at 60hz.
+        while self.window.is_open() && !self.window.is_key_down(Key::Escape) {
             let frame_start = Instant::now();
 
-            let instructions_this_frame = INSTRUCTIONS_PER_SECOND / FRAMES_PER_SECOND;
-            for _ in 0..instructions_this_frame {
-                let opcode = self.fetch();
-                self.decode_and_execute(opcode);
+            if let Some(x) = self.waiting_for_key {
+                self.wait_for_key_press(x)
+            } else {
+                let instructions_this_frame = INSTRUCTIONS_PER_SECOND / FRAMES_PER_SECOND;
+                for _ in 0..instructions_this_frame {
+                    let opcode = self.fetch();
+                    self.decode_and_execute(opcode);
+                }
+            }
+
+            // Decrement our sound and delay timers since they run at 60Hz as well.
+            if self.registers.dt > 0 {
+                self.registers.dt -= 1
+            }
+            if self.registers.st > 0 {
+                self.registers.st -= 1;
+
+                // After decrementing, if we still have a count, then play the audio.
+                if self.registers.st > 0 {
+                    self.audio.set_playing(true);
+                } else {
+                    self.audio.set_playing(false);
+                }
             }
 
             // Redraw the display to the screen.
-            self.display.draw();
+            self.display.draw(&mut self.window);
 
             // Sleep until the next frame.
             let elapsed = (Instant::now() - frame_start).as_secs_f64();
@@ -73,7 +142,10 @@ impl CPU {
     fn fetch(&mut self) -> u16 {
         // Load the next instruction from the PC from memory.
         let instruction = u16::from_be_bytes(
-            self.memory.load_data(self.registers.pc, 2).try_into().unwrap(),
+            self.memory
+                .load_data(self.registers.pc, 2)
+                .try_into()
+                .unwrap(),
         );
         self.registers.pc += 2;
         instruction
@@ -93,40 +165,43 @@ impl CPU {
         match nibbles {
             // (0x0, n1, n2, n3) => {}, // SYS addr. Ignored by modern interpreters.
             (0x0, 0x0, 0xE, 0x0) => self.clear_screen(), // CLS
-            (0x0, 0x0, 0xE, 0xE) => self.ret(), // RET
+            (0x0, 0x0, 0xE, 0xE) => self.ret(),          // RET
             (0x1, n1, n2, n3) => self.jump(nibbles_to_addr(n1, n2, n3)), // JP addr
             (0x2, n1, n2, n3) => self.call(nibbles_to_addr(n1, n2, n3)), // CALL addr
             (0x3, x, k1, k2) => self.skip_if_eq(x as u8, nibbles_to_byte(k1, k2)), // SE Vx, byte
             (0x4, x, k1, k2) => self.skip_if_not_eq(x as u8, nibbles_to_byte(k1, k2)), // SNE Vx, byte
-            (0x5, x, y, 0x0) => self.skip_if_reg_eq(x as u8, y as u8), // SE Vx, Vy
+            (0x5, x, y, 0x0) => self.skip_if_reg_eq(x as u8, y as u8),                 // SE Vx, Vy
             (0x6, x, k1, k2) => self.load_vx_byte(x as u8, nibbles_to_byte(k1, k2)), // LD Vx, byte
-            (0x7, x, k1, k2) => self.add_vx_byte(x as u8, nibbles_to_byte(k1, k2)), // ADD Vx, byte
-            (0x8, x, y, 0x0) => self.load_vx_vy(x as u8, y as u8), // LD Vx, Vy
-            (0x8, x, y, 0x1) => self.or_vx_vy(x as u8, y as u8), // OR Vx, Vy
-            (0x8, x, y, 0x2) => self.and_vx_vy(x as u8, y as u8), // AND Vx, Vy
-            (0x8, x, y, 0x3) => self.xor_vx_vy(x as u8, y as u8), // XOR Vx, Vy
-            (0x8, x, y, 0x4) => self.add_vx_vy(x as u8, y as u8), // ADD Vx, Vy
-            (0x8, x, y, 0x5) => self.sub_vx_vy(x as u8, y as u8), // SUB Vx, Vy
+            (0x7, x, k1, k2) => self.add_vx_byte(x as u8, nibbles_to_byte(k1, k2)),  // ADD Vx, byte
+            (0x8, x, y, 0x0) => self.load_vx_vy(x as u8, y as u8),                   // LD Vx, Vy
+            (0x8, x, y, 0x1) => self.or_vx_vy(x as u8, y as u8),                     // OR Vx, Vy
+            (0x8, x, y, 0x2) => self.and_vx_vy(x as u8, y as u8),                    // AND Vx, Vy
+            (0x8, x, y, 0x3) => self.xor_vx_vy(x as u8, y as u8),                    // XOR Vx, Vy
+            (0x8, x, y, 0x4) => self.add_vx_vy(x as u8, y as u8),                    // ADD Vx, Vy
+            (0x8, x, y, 0x5) => self.sub_vx_vy(x as u8, y as u8),                    // SUB Vx, Vy
             (0x8, x, _y, 0x6) => self.shift_right(x as u8), // SHR Vx {, Vy}
             (0x8, x, y, 0x7) => self.sub_vy_vx(y as u8, x as u8), // SUBN Vx, Vy
-            (0x8, x, _y, 0xE) => self.shift_left(x as u8), // SHL {, Vy}
+            (0x8, x, _y, 0xE) => self.shift_left(x as u8),  // SHL {, Vy}
             (0x9, x, y, 0x0) => self.skip_if_reg_not_eq(x as u8, y as u8), // SNE Vx, Vy
             (0xA, n1, n2, n3) => self.load_i(nibbles_to_addr(n1, n2, n3)), // LD I, addr
-            (0xB, n1, n2, n3) => todo!(), // JP V0, addr
-            (0xC, x, k1, k2) => todo!(), // RND Vx, byte
+            (0xB, n1, n2, n3) => self.jump_with_offset(nibbles_to_addr(n1, n2, n3)), // JP V0, addr
+            (0xC, x, k1, k2) => self.rand(x as u8, nibbles_to_byte(k1, k2)), // RND Vx, byte
             (0xD, x, y, n) => self.draw(x as u8, y as u8, n), // DRW Vx, Vy, nibble
-            (0xE, x, 0x9, 0xE) => todo!(), // SKP Vx
-            (0xE, x, 0xA, 0x1) => todo!(), // SKNP Vx
-            (0xF, x, 0x0, 0x7) => todo!(), // LD Vx, DT
-            (0xF, x, 0x0, 0xA) => todo!(), // LD Vx, K
-            (0xF, x, 0x1, 0x5) => todo!(), // LD DT, Vx
-            (0xF, x, 0x1, 0x8) => todo!(), // LD ST, Vx
-            (0xF, x, 0x1, 0xE) => self.add_i_vx(x as u8), // ADD I, Vx
-            (0xF, x, 0x2, 0x9) => todo!(), // LD F, Vx
+            (0xE, x, 0x9, 0xE) => self.skip_if_key_pressed(x as u8), // SKP Vx
+            (0xE, x, 0xA, 0x1) => self.skip_if_key_not_pressed(x as u8), // SKNP Vx
+            (0xF, x, 0x0, 0x7) => self.get_delay_timer(x as u8), // LD Vx, DT
+            (0xF, x, 0x0, 0xA) => self.wait_for_key_press(x as u8), // LD Vx, K
+            (0xF, x, 0x1, 0x5) => self.set_delay_timer(x as u8), // LD DT, Vx
+            (0xF, x, 0x1, 0x8) => self.set_sound_timer(x as u8), // LD ST, Vx
+            (0xF, x, 0x1, 0xE) => self.add_i_vx(x as u8),   // ADD I, Vx
+            (0xF, x, 0x2, 0x9) => self.load_font_sprite(x as u8), // LD F, Vx
             (0xF, x, 0x3, 0x3) => self.store_bcd_into_memory(x as u8), // LD B, Vx
             (0xF, x, 0x5, 0x5) => self.store_regs_into_memory(x as u8), // LD [I], Vx
             (0xF, x, 0x6, 0x5) => self.load_from_memory_into_regs(x as u8), // LD Vx, [I]
-            _ => panic!("Unknown instruction: {:X}{:X}{:X}{:X}", nibbles.0, nibbles.1, nibbles.2, nibbles.3),
+            _ => panic!(
+                "Unknown instruction: {:X}{:X}{:X}{:X}",
+                nibbles.0, nibbles.1, nibbles.2, nibbles.3
+            ),
         };
     }
 
@@ -144,6 +219,12 @@ impl CPU {
     fn jump(&mut self, addr: u16) {
         debug!("Jumping to addr: {addr}");
         self.registers.pc = addr;
+    }
+
+    fn jump_with_offset(&mut self, addr: u16) {
+        let val_0 = self.registers.v0;
+        debug!("Jumping to addr with offset : {addr} + {val_0}");
+        self.registers.pc = addr + val_0 as u16;
     }
 
     fn call(&mut self, addr: u16) {
@@ -180,6 +261,43 @@ impl CPU {
         let val_y = self.registers.get_v_register(y);
         if val_x != val_y {
             self.registers.pc += 2;
+        }
+    }
+
+    fn skip_if_key_pressed(&mut self, x: u8) {
+        let val_x = self.registers.get_v_register(x);
+        let key = Self::KEY_MAPPING[val_x as usize];
+        if self.window.is_key_down(key) {
+            self.registers.pc += 2;
+        }
+    }
+
+    fn skip_if_key_not_pressed(&mut self, x: u8) {
+        let val_x = self.registers.get_v_register(x);
+        let key = Self::KEY_MAPPING[val_x as usize];
+        if !self.window.is_key_down(key) {
+            self.registers.pc += 2;
+        }
+    }
+
+    fn wait_for_key_press(&mut self, x: u8) {
+        // Get the keys pressed, and filter them down just by the ones that are
+        // mapped in CHIP-8.
+        let keys: Vec<usize> = self
+            .window
+            .get_keys_pressed(minifb::KeyRepeat::No)
+            .iter()
+            .filter_map(|key| Self::KEY_MAPPING.iter().position(|x| x == key))
+            .collect();
+
+        if keys.is_empty() {
+            // If no keys were pressed, or they weren't mapped, then wait until another key is pressed.
+            self.waiting_for_key = Some(x)
+        } else {
+            // We have a key, so set its value into the Vx and unblock.
+            self.waiting_for_key = None;
+            self.registers
+                .set_v_register(x, *keys.first().unwrap() as u8);
         }
     }
 
@@ -229,33 +347,33 @@ impl CPU {
 
         let (new_val, did_overflow) = val_x.overflowing_add(val_y);
         self.registers.set_v_register(x, new_val);
-        self.registers.vf = if did_overflow {1} else {0};
+        self.registers.vf = if did_overflow { 1 } else { 0 };
     }
 
     fn sub_vx_vy(&mut self, x: u8, y: u8) {
         let val_x = self.registers.get_v_register(x);
         let val_y = self.registers.get_v_register(y);
         self.registers.set_v_register(x, val_x.wrapping_sub(val_y));
-        self.registers.vf = if val_x > val_y {1} else {0};
+        self.registers.vf = if val_x >= val_y { 1 } else { 0 };
     }
 
     fn sub_vy_vx(&mut self, y: u8, x: u8) {
         let val_x = self.registers.get_v_register(x);
         let val_y = self.registers.get_v_register(y);
         self.registers.set_v_register(x, val_y.wrapping_sub(val_x));
-        self.registers.vf = if val_y > val_x {1} else {0};
+        self.registers.vf = if val_y >= val_x { 1 } else { 0 };
     }
 
     fn shift_right(&mut self, x: u8) {
         let val_x = self.registers.get_v_register(x);
         self.registers.set_v_register(x, val_x >> 1);
-        self.registers.vf = if val_x.trailing_ones() > 0 {1} else {0};
+        self.registers.vf = if val_x.trailing_ones() > 0 { 1 } else { 0 };
     }
 
     fn shift_left(&mut self, x: u8) {
         let val_x = self.registers.get_v_register(x);
         self.registers.set_v_register(x, val_x << 1);
-        self.registers.vf = if val_x.leading_ones() > 0 {1} else {0};
+        self.registers.vf = if val_x.leading_ones() > 0 { 1 } else { 0 };
     }
 
     fn add_i_vx(&mut self, x: u8) {
@@ -265,6 +383,21 @@ impl CPU {
         self.registers.i = val_x + addr;
     }
 
+    fn set_delay_timer(&mut self, x: u8) {
+        let val_x = self.registers.get_v_register(x);
+        self.registers.dt = val_x;
+    }
+
+    fn get_delay_timer(&mut self, x: u8) {
+        let val_dt = self.registers.dt;
+        self.registers.set_v_register(x, val_dt);
+    }
+
+    fn set_sound_timer(&mut self, x: u8) {
+        let val_x = self.registers.get_v_register(x);
+        self.registers.st = val_x;
+    }
+
     fn store_bcd_into_memory(&mut self, x: u8) {
         // Store BCD representation of Vx in memory locations I, I+1, and I+2.
         // The interpreter takes the decimal value of Vx, and places the hundreds digit in memory
@@ -272,9 +405,9 @@ impl CPU {
         let val_x = self.registers.get_v_register(x);
         let addr = self.registers.i;
         let data = vec![
-            (val_x / 100) % 10,  // hundreds digit
-            (val_x / 10) % 10,   // tens digit
-            val_x % 10,          // units digit
+            (val_x / 100) % 10, // hundreds digit
+            (val_x / 10) % 10,  // tens digit
+            val_x % 10,         // units digit
         ];
         self.memory.store_data(addr, &data);
     }
@@ -282,7 +415,7 @@ impl CPU {
     fn store_regs_into_memory(&mut self, x: u8) {
         // Stores x registers worth of data into memory at the addr stored in I.
         let addr = self.registers.i;
-        let mut data = Vec::with_capacity((x+1) as usize);
+        let mut data = Vec::with_capacity((x + 1) as usize);
         for i in 0..=x {
             data.push(self.registers.get_v_register(i));
         }
@@ -292,10 +425,21 @@ impl CPU {
     fn load_from_memory_into_regs(&mut self, x: u8) {
         // Loads x registers worth of data from memory, starting at I, into V(0-x).
         let addr = self.registers.i;
-        let data = self.memory.load_data(addr, (x+1) as u16);
+        let data = self.memory.load_data(addr, (x + 1) as u16);
         for i in 0..=x {
             self.registers.set_v_register(i, data[i as usize]);
         }
+    }
+
+    fn rand(&mut self, x: u8, byte: u8) {
+        let r_val: u8 = rand::rng().random();
+        self.registers.set_v_register(x, r_val & byte);
+    }
+
+    fn load_font_sprite(&mut self, x: u8) {
+        let val_x = self.registers.get_v_register(x);
+        let addr = self.memory.find_font_sprite(val_x);
+        self.registers.i = addr;
     }
 
     fn draw(&mut self, x: u8, y: u8, n: u16) {
@@ -303,7 +447,10 @@ impl CPU {
         let y = self.registers.get_v_register(y) % HEIGHT as u8;
         let sprite = self.memory.load_data(self.registers.i, n);
 
-        debug!("Drawing sprite to the display: {:?}, X: {}, Y: {}", sprite, x, y);
+        debug!(
+            "Drawing sprite to the display: {:?}, X: {}, Y: {}",
+            sprite, x, y
+        );
 
         // Go through each byte in the sprite and apply it to the display.
         let mut any_turned_off = false;
@@ -311,12 +458,12 @@ impl CPU {
             let byte = sprite[j];
             let new_y = y + j as u8;
             if new_y >= HEIGHT as u8 {
-                break
+                break;
             }
             for i in 0..8 {
                 let new_x = x + i;
                 if new_x >= WIDTH as u8 {
-                    break
+                    break;
                 }
 
                 let val = bit_at_index(byte, i);
@@ -329,7 +476,7 @@ impl CPU {
         }
 
         // Set the flag register if we've turned any pixels off.
-        self.registers.vf = if any_turned_off {1} else {0};
+        self.registers.vf = if any_turned_off { 1 } else { 0 };
     }
 }
 
@@ -344,7 +491,7 @@ fn nibbles_to_addr(n1: u16, n2: u16, n3: u16) -> u16 {
 fn bit_at_index(byte: u8, i: u8) -> bool {
     // The index provided is for the index from left-to-right, so we need to shift
     // 7-i digits so we properly handle each index correctly.
-    ((byte >> (7-i)) & 1) != 0
+    ((byte >> (7 - i)) & 1) != 0
 }
 
 type Opcode = u16;
@@ -374,8 +521,8 @@ struct Registers {
 
     // Special purpose registers.
     pc: u16, // Program counter
-    sp: u8, // Stack pointer
-    i: u16, // Index register (used for storing pointers to memory)
+    sp: u8,  // Stack pointer
+    i: u16,  // Index register (used for storing pointers to memory)
 }
 
 impl Registers {
@@ -455,14 +602,12 @@ The first 512 bytes, from 0x000 to 0x1FF, are where the original interpreter was
 and should not be used by programs.
 */
 struct Memory {
-    data: [u8; 4096]
+    data: [u8; 4096],
 }
 
 impl Memory {
     fn new() -> Self {
-        let mut mem = Self{
-            data: [0; 4096]
-        };
+        let mut mem = Self { data: [0; 4096] };
         mem.initialize_font();
         mem
     }
@@ -486,7 +631,7 @@ impl Memory {
             0xF0, 0x80, 0x80, 0x80, 0xF0, // C
             0xE0, 0x90, 0x90, 0x90, 0xE0, // D
             0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
-            0xF0, 0x80, 0xF0, 0x80, 0x80  // F
+            0xF0, 0x80, 0xF0, 0x80, 0x80, // F
         ];
         self.store_data(0x050, &font);
     }
@@ -499,7 +644,14 @@ impl Memory {
     fn load_data(&self, addr: u16, n: u16) -> &[u8] {
         let addr = addr as usize;
         let n = n as usize;
-        self.data[addr..addr+n].as_ref()
+        self.data[addr..addr + n].as_ref()
+    }
+
+    fn find_font_sprite(&self, offset: u8) -> u16 {
+        // Fonts start at 0x50.
+        // Each sprite is 5 bytes, so add 5x the offset to find
+        // the beginning of that font sprite.
+        (0x50 + (5 * offset)) as u16
     }
 }
 
@@ -514,7 +666,7 @@ struct Stack {
 
 impl Stack {
     fn new() -> Self {
-        Self{
+        Self {
             data: [0; 16],
             i: 0,
         }
@@ -539,7 +691,6 @@ impl Stack {
 }
 
 struct Display {
-    window: Window,
     // 64 x 32 pixels in the display of black/white.
     pixels: [bool; WIDTH * HEIGHT],
 }
@@ -549,21 +700,7 @@ const WHITE: u32 = 0xFFFFFF;
 
 impl Display {
     fn new() -> Self {
-        let mut window = Window::new(
-            "Test - ESC to exit",
-            WIDTH,
-            HEIGHT,
-            WindowOptions {
-                resize: true,
-                ..WindowOptions::default()
-            }
-        ).unwrap_or_else(|e| {
-                panic!("{}", e);
-            });
-        window.set_target_fps(FRAMES_PER_SECOND);
-
         Self {
-            window,
             pixels: [false; WIDTH * HEIGHT],
         }
     }
@@ -585,11 +722,8 @@ impl Display {
         prev == true && new == true
     }
 
-    fn draw(&mut self) {
-        let buf = self.pixels
-            .map(|p| if p {WHITE} else {BLACK});
-        self.window
-            .update_with_buffer(&buf, WIDTH, HEIGHT)
-            .unwrap();
+    fn draw(&mut self, window: &mut Window) {
+        let buf = self.pixels.map(|p| if p { WHITE } else { BLACK });
+        window.update_with_buffer(&buf, WIDTH, HEIGHT).unwrap();
     }
 }
