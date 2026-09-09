@@ -1,0 +1,9 @@
+[package]
+name = "chip8-emulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+minifb = "0.28.0"
+simple_logger = "5.2.0"
+log = "0.4.33"
